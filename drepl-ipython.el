@@ -1,9 +1,10 @@
 ;;; drepl.el --- REPL protocol for the dumb terminal   -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023  Augusto Stoffel
+;; Copyright (C) 2023  Free Software Foundation, Inc.
 
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: languages, processes
+;; URL: https://github.com/astoff/drepl
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -28,7 +29,7 @@
 
 (require 'comint-mime)
 (require 'drepl)
-(require 'python)
+(require 'python)                       ;For `python-interpreter' only
 
 ;;; Customization options
 
@@ -58,14 +59,8 @@ substring \"{}\" is replaced by the execution count."
                       default-directory))
   "File name of the startup script.")
 
-(defclass drepl-ipython (drepl-base) nil)
-(put 'drepl-ipython 'drepl--buffer-name "IPython")
-
-;;;###autoload
-(defun drepl-run-ipython ()
-  "Start the IPython interpreter."
-  (interactive)
-  (drepl--run 'drepl-ipython t))
+;;;###autoload (autoload 'drepl-ipython "drepl-ipython" nil t)
+(drepl--define drepl-ipython :display-name "IPython")
 
 (cl-defmethod drepl--command ((_ drepl-ipython))
   `(,python-interpreter "-c"
@@ -73,7 +68,7 @@ substring \"{}\" is replaced by the execution count."
 
 (cl-defmethod drepl--init ((_ drepl-ipython))
   (drepl-mode)
-  (setq-local comint-indirect-setup-function #'python-mode)
+  (drepl--adapt-comint-to-mode ".py")
   (push '("5151" . comint-mime-osc-handler) ansi-osc-handlers)
   (let ((buffer (current-buffer)))
     (with-temp-buffer

@@ -1,9 +1,10 @@
 ;;; drepl.el --- REPL protocol for the dumb terminal   -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023  Augusto Stoffel
+;; Copyright (C) 2023  Free Software Foundation, Inc.
 
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: languages, processes
+;; URL: https://github.com/astoff/drepl
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -27,13 +28,16 @@
 
 ;;; Customization options
 (require 'drepl)
-(require 'lua-mode)
 
 (defgroup drepl-lua nil
   "Lua shell implemented via dREPL."
   :group 'drepl
   :group 'lua
   :link '(url-link "https://github.com/astoff/drepl"))
+
+(defcustom drepl-lua-program "lua"
+  "Name of the Lua executable."
+  :type 'string)
 
 (defvar drepl-lua--start-file
   (expand-file-name "drepl-lua.lua"
@@ -42,21 +46,15 @@
                       default-directory))
   "File name of the startup script.")
 
-(defclass drepl-lua (drepl-base) nil)
-(put 'drepl-lua 'drepl--buffer-name "Lua")
-
-;;;###autoload
-(defun drepl-run-lua ()
-  "Start the Lua interpreter."
-  (interactive)
-  (drepl--run 'drepl-lua t))
+;;;###autoload (autoload 'drepl-lua "drepl-lua" nil t)
+(drepl--define drepl-lua :display-name "Lua")
 
 (cl-defmethod drepl--command ((_ drepl-lua))
-  '("lua" "-v" "-e" "loadfile()():main()"))
+  `(,drepl-lua-program "-v" "-e" "loadfile()():main()"))
 
 (cl-defmethod drepl--init ((_ drepl-lua))
   (drepl-mode)
-  (setq-local comint-indirect-setup-function #'lua-mode)
+  (drepl--adapt-comint-to-mode ".lua")
   (let ((buffer (current-buffer)))
     (with-temp-buffer
       (insert-file-contents drepl-lua--start-file)

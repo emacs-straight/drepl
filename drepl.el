@@ -1,9 +1,12 @@
 ;;; drepl.el --- REPL protocol for the dumb terminal   -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023  Augusto Stoffel
+;; Copyright (C) 2023  Free Software Foundation, Inc.
 
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: languages, processes
+;; URL: https://github.com/astoff/drepl
+;; Package-Requires: ((emacs "29.1") (comint-mime "0.3"))
+;; Version: 0.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -33,11 +36,12 @@
 
 ;;; Code:
 
-(require 'eieio)
 (require 'cl-lib)
 (require 'comint)
 (require 'project)
-(eval-when-compile (require 'subr-x))
+(eval-when-compile
+  (require 'derived)
+  (require 'subr-x))
 
 ;;; Variables and customization options
 
@@ -62,37 +66,79 @@ which determines whether to ask or return nil when in doubt."
 (defvar-local drepl--current nil
   "The dREPL associated to the current buffer.
 In dREPL buffers, this is the dREPL object itself.  In all other
-buffers, this is the dREPL buffer or nil.")
+buffers, this is a dREPL buffer or nil.")
 
-(defvar drepl--verbose nil)
+(defvar drepl--log-buffer nil
+  "Name of the event log buffer, or nil to disable logging.")
 
 ;;; Basic definitions
 
-(defclass drepl-base ()
-  ((buffer :initarg :buffer :reader drepl--buffer)
-   (status :initform nil :accessor drepl--status)
-   (last-request-id :initform 0)
-   (requests :initform nil)
-   (pending :initform nil))
-  :abstract t
-  :documentation "Base dREPL class.")
+(cl-defstruct (drepl-base
+               (:constructor nil)
+               (:copier nil)
+               (:conc-name drepl--))
+  "Base dREPL structure, to be inherited by implementations."
+  (buffer nil :read-only t :documentation "\
+The buffer where the REPL is running.")
+  (status nil :documentation "\
+The last reported interpreter status.")
+  (last-id 0 :documentation "\
+The id of the last request sent.")
+  (callbacks nil :documentation "\
+Alist of (ID . CALLBACK) keeping track of requests sent but not
+yet replied to.")
+  (pending nil :documentation "\
+List of requests pending to be sent."))
 
 (defun drepl--process (repl)
   "The underlying process of dREPL object REPL."
   (get-buffer-process (drepl--buffer repl)))
 
-(defmacro drepl--message (fmtstring &rest args)
-  "Write a message to *drepl-log* buffer if `drepl--verbose' is non-nil.
-The message is formed by calling `format' with FMTSTRING and ARGS."
-  (let ((msg (lambda (&rest args)
-               (with-current-buffer (get-buffer-create "*drepl-log*")
-                 (goto-char (point-max))
-                 (when-let ((w (get-buffer-window)))
-                   (set-window-point w (point)))
-                 (insert (propertize (format-time-string "[%T] ") 'face 'error)
-                         (apply #'format args)
-                         ?\n)))))
-    `(when drepl--verbose (funcall ,msg ,fmtstring ,@args))))
+(cl-defmacro drepl--define (name &key display-name docstring extra-slots)
+  "Define a REPL type.
+NAME is a symbol to name the struct type identifying the REPL as
+well as the interactive command to launch it.
+
+DISPLAY-NAME is a string used to generate the default buffer name
+of REPL instances, among other things.
+
+DOCSTRING is the docstring of the command NAME.
+
+EXTRA-SLOTS is a list of slots passed to `cl-defstruct' in
+addition to those of `drepl-base'."
+  (let* ((display-name (or display-name (symbol-name name)))
+         (conc-name (intern (format "%s--" name))))
+    `(progn
+       (defun ,name ()
+         ,(or docstring
+              (format "Start the %s interpreter." display-name))
+         (interactive)
+         (drepl--run ',name t))
+       (cl-defstruct (,name
+                      (:include drepl-base)
+                      (:copier nil)
+                      (:constructor nil)
+                      (:constructor ,(intern (format "%screate" conc-name)))
+                      (:conc-name ,conc-name))
+         ,(format "Structure keeping the state of a %s REPL." display-name)
+         ,@extra-slots)
+       (put ',name 'drepl--display-name ,display-name))))
+
+(defun drepl--log-message-1 (&rest args)
+  "Helper function for `drepl--log-message'.
+ARGS is the entire argument list of `drepl--log-message'."
+  (with-current-buffer (get-buffer-create drepl--log-buffer)
+    (goto-char (point-max))
+    (when-let ((w (get-buffer-window)))
+      (set-window-point w (point)))
+    (insert (propertize (format-time-string "[%T] ") 'face 'error)
+            (apply #'format args)
+            ?\n)))
+
+(defmacro drepl--log-message (string &rest args)
+  "Write a message to buffer pointed by `drepl--log-buffer', if non-nil.
+The message is formed by calling `format' with STRING and ARGS."
+  `(when drepl--log-buffer (drepl--log-message-1 ,string ,@args)))
 
 ;;; Communication protocol
 
@@ -114,11 +160,23 @@ DATA is a plist containing the request arguments, as well as :op
 and :id entries."
   (setf (drepl--status repl) 'busy)
   (let ((encoded (drepl--json-encode data)))
-    (drepl--message "send %s" encoded)
+    (drepl--log-message "send %s" encoded)
     (process-send-string (drepl--process repl)
                          (format "\e%%%s\n" encoded))))
 
-(cl-defgeneric drepl--communicate (repl callback op &rest args)
+(defun drepl--communicate (repl callback op &rest args)
+  "Send a request to REPL.
+
+OP is the operation name as as symbol and ARGS is a plist of
+arguments for that operation.
+
+When REPL responds, CALLBACK is called with one argument, the
+response data.  This functions returns immediately with the id
+number of the request.
+
+CALLBACK may also be the symbol `sync' to make a synchronous
+request.  In this case, the REPL must be in the state `ready',
+and this function returns the response data directly."
   (if (eq callback 'sync)
       (progn (unless (eq (drepl--status repl) 'ready)
                (user-error "%s is busy" repl))
@@ -127,44 +185,48 @@ and :id entries."
                (apply #'drepl--communicate repl cb op args)
                (while (eq result :pending) (accept-process-output))
                result))
-    (let* ((id (cl-incf (oref repl last-request-id)))
+    (let* ((id (cl-incf (drepl--last-id repl)))
            (data `(:id ,id :op ,(symbol-name op) ,@args)))
-      (push (cons id callback) (if-let ((reqs (oref repl requests)))
+      (push (cons id callback) (if-let ((reqs (drepl--callbacks repl)))
                                    (cdr reqs)
-                                 (oref repl requests)))
+                                 (drepl--callbacks repl)))
       (if (eq 'ready (drepl--status repl))
           (drepl--send-request repl data)
-        (push (cons id data) (oref repl pending)))
+        (push (cons id data) (drepl--pending repl)))
       id)))
 
+(defun drepl--osc-handler (_cmd text)
+  "Function intended for use as an entry of `ansi-osc-handlers'.
+TEXT is a still unparsed message received from the interpreter."
+  (drepl--log-message "read %s" text)
+  (let* ((data (drepl--json-decode text))
+         (id (alist-get 'id data))
+         (callback (if id
+                       (prog1
+                           (alist-get id (drepl--callbacks drepl--current))
+                         (setf (alist-get id (drepl--callbacks drepl--current)
+                                          nil 'remove)
+                               nil))
+                     (apply-partially #'drepl--handle-notification
+                                      drepl--current))))
+    (when-let ((nextreq (and (eq (drepl--status drepl--current) 'ready)
+                             (pop (drepl--pending drepl--current)))))
+      (drepl--send-request drepl--current nextreq))
+    (when callback
+      (funcall callback data))))
+
 (cl-defgeneric drepl--handle-notification (repl data)
+  "Method called when REPL sends a notification.
+DATA is the content of the message."
   (pcase (alist-get 'op data)
     ("status" (setf (drepl--status repl)
                     (intern (alist-get 'status data))))
     ("getoptions"
      (setf (drepl--status repl) 'ready)
      (drepl--set-options repl data))
-    ("log" (drepl--message "log:%s: %s"
-                           (buffer-name)
-                           (alist-get 'text data)))))
-
-(defun drepl--osc-handler (_cmd text)
-  (drepl--message "read %s" text)
-  (let* ((data (drepl--json-decode text))
-         (id (alist-get 'id data))
-         (callback (if id
-                       (prog1
-                           (alist-get id (oref drepl--current requests))
-                         (setf (alist-get id (oref drepl--current requests)
-                                          nil 'remove)
-                               nil))
-                     (apply-partially #'drepl--handle-notification
-                                      drepl--current))))
-    (when-let ((nextreq (and (eq (drepl--status drepl--current) 'ready)
-                             (pop (oref drepl--current pending)))))
-      (drepl--send-request drepl--current nextreq))
-    (when callback
-      (funcall callback data))))
+    ("log" (drepl--log-message "log:%s: %s"
+                               (buffer-name)
+                               (alist-get 'text data)))))
 
 ;;; Buffer association
 
@@ -181,7 +243,7 @@ and has the given status.
 If ENSURE is non-nil, produce an error if there is no REPL
 associated to the current buffer."
   (let ((repl (cond
-               ((recordp drepl--current) drepl--current)
+               ((drepl-base-p drepl--current) drepl--current)
                ((buffer-live-p drepl--current)
                 (buffer-local-value 'drepl--current drepl--current))
                (t (let* ((dir default-directory)
@@ -196,7 +258,7 @@ associated to the current buffer."
                     (buffer-local-value 'drepl--current (car buffers))))))))
     (when (and ensure (not repl))
       (user-error (substitute-command-keys
-                   "No REPL, use \\[drepl-associate] to choose one")))
+                   "No default REPL, use \\[drepl-associate] to choose one")))
     (when (or (not status)
               (and repl
                    (memq (process-status (drepl--process repl))
@@ -249,9 +311,11 @@ interactively."
   (get-text-property 0 'drepl--annot cand))
 
 (cl-defgeneric drepl--completion-bounds (_repl)
+  "Return the start and end of completion region as a cons cell."
   (bounds-of-thing-at-point 'symbol))
 
-(cl-defgeneric drepl--completion-cadidates (repl code offset)
+(defun drepl--completion-cadidates (repl code offset)
+  "Ask REPL for possible completions of CODE with point at OFFSET."
   (let ((response (while-no-input
                     (drepl--communicate repl 'sync 'complete
                                         :code code
@@ -262,6 +326,7 @@ interactively."
             (alist-get 'candidates response))))
 
 (defun drepl--complete ()
+  "Function intended for use as a member of `completion-at-point-functions'."
   (when-let ((repl (when (derived-mode-p 'drepl-mode)
                      (drepl--get-repl 'ready)))
              (bounds (drepl--completion-bounds repl))
@@ -283,6 +348,7 @@ interactively."
 ;;; Eval operation
 
 (cl-defgeneric drepl--eval (repl code)
+  "Send an eval request to REPL with CODE as argument."
   (drepl--communicate repl #'ignore 'eval :code code))
 
 (defun drepl--send-string (proc string)
@@ -294,7 +360,7 @@ STRING to the process."
                 (drepl--get-repl 'ready))))
     (if repl
         (drepl--eval repl string)
-      (drepl--message "send %s" string)
+      (drepl--log-message "send %s" string)
       (comint-simple-send proc string))))
 
 (defun drepl-eval (code)
@@ -347,17 +413,10 @@ insert start a continuation line instead."
 
 ;;; Describe operation
 
-(cl-defgeneric drepl--call-eldoc (repl callback)
-  "Compute help on thing at point and pass it to Eldoc's CALLBACK function."
-  (when-let ((offset (- (point) (cdr comint-last-prompt)))
-             (code (when (>= offset 0)
-                     (buffer-substring-no-properties
-                      (cdr comint-last-prompt)
-                      (point-max))))
-             (cb (lambda (data) (apply callback (drepl--format-eldoc repl data)))))
-    (drepl--communicate repl cb 'describe :code code :offset offset)))
-
 (cl-defgeneric drepl--format-eldoc (repl data)
+  "Format REPL response DATA to a `describe' operation.
+The return value is passed directly to an Eldoc callback.  See
+`eldoc-documentation-functions' for details."
   (ignore repl)
   (let-alist data
     (list
@@ -377,59 +436,20 @@ insert start a continuation line instead."
      :thing .name)))
 
 (defun drepl--eldoc-function (callback &rest _)
-  "Function intended to be a member of `eldoc-documentation-functions'."
-  (when-let ((repl (drepl--get-repl 'ready)))
-    (drepl--call-eldoc repl callback)))
+  "Function intended for use as a member of `eldoc-documentation-functions'.
+See that variable's docstring for a description of CALLBACK."
+  (when-let ((repl (when (derived-mode-p 'drepl-mode)
+                     (drepl--get-repl 'ready)))
+             (offset (- (point) (cdr comint-last-prompt)))
+             (code (when (>= offset 0)
+                     (buffer-substring-no-properties
+                      (cdr comint-last-prompt)
+                      (point-max))))
+             (cb (lambda (data)
+                   (apply callback (drepl--format-eldoc repl data)))))
+    (drepl--communicate repl cb 'describe :code code :offset offset)))
 
-;;; Initialization and restart
-
-(defun drepl--project-directory (ask)
-  "Return the current project root directory.
-If it can be determined and ASK is non-nil, ask for a project;
-otherwise fall back to `default-directory'."
-  (if-let ((proj (project-current ask)))
-      (project-root proj)
-    default-directory))
-
-(defun drepl--buffer-name (class directory)
-  "Buffer name for a REPL of the given CLASS running in DIRECTORY."
-  (format "%s/*%s*"
-          (file-name-nondirectory
-           (directory-file-name directory))
-          (or (get class 'drepl--buffer-name) class)))
-
-(defun drepl--get-buffer-create (class ask)
-  "Get or create a dREPL buffer of the given CLASS.
-The directory of the buffer is determined by
-`drepl-directory'.  If ASK is non-nil, allow an interactive query
-if needed."
-  (if (eq (type-of drepl--current) class)
-      (drepl--buffer drepl--current)
-    (let ((default-directory (if (stringp drepl-directory)
-                                 drepl-directory
-                               (funcall drepl-directory ask))))
-      (get-buffer-create (drepl--buffer-name class default-directory)))))
-
-(cl-defgeneric drepl--command (repl)
-  "The command to start the REPL interpreter as a list of strings."
-  (ignore repl)
-  (error "This needs an implementation"))
-
-(cl-defgeneric drepl--init (repl)
-  "Initialization code for REPL.
-This function is called in the REPL buffer after a Comint has
-been started in it.  It should call `drepl-mode' or a derived
-mode and perform all other desired initialization procedures."
-  (ignore repl)
-  (error "This needs an implementation"))
-
-(cl-defgeneric drepl--set-options (repl data)
-  "Implementation of the `setoptions' operation.
-This method is called when the REPL sends a `getoptions'
-notification.  The REPL is in `ready' state when this happens.
-The notification message is passed as DATA."
-  (ignore repl data)
-  (error "This needs an implementation"))
+;;; REPL restart
 
 (cl-defgeneric drepl--restart (repl hard)
   "Generic method to restart a REPL.
@@ -450,19 +470,91 @@ hard reset."
   (interactive "P")
   (drepl--restart (drepl--get-repl nil t) hard))
 
-(defun drepl--run (class may-prompt)
-  (let ((buffer (drepl--get-buffer-create class may-prompt)))
+;;; REPL initialization
+
+(defun drepl--project-directory (may-prompt)
+  "Return the current project root directory.
+If it can be determined and MAY-PROMPT is non-nil, ask for a
+project; otherwise fall back to `default-directory'."
+  (if-let ((proj (project-current may-prompt)))
+      (project-root proj)
+    default-directory))
+
+(defun drepl--buffer-name (type directory)
+  "Buffer name for a REPL of the given TYPE running in DIRECTORY."
+  (format "%s/*%s*"
+          (file-name-nondirectory
+           (directory-file-name directory))
+          (or (get type 'drepl--display-name) type)))
+
+(defun drepl--get-buffer-create (type may-prompt)
+  "Get or create a dREPL buffer of the given TYPE.
+The directory of the buffer is determined by `drepl-directory'.
+If MAY-PROMPT is non-nil, allow an interactive query if needed."
+  (if (eq type (type-of drepl--current))
+      (drepl--buffer drepl--current)
+    (let ((default-directory (if (stringp drepl-directory)
+                                 drepl-directory
+                               (funcall drepl-directory may-prompt))))
+      (get-buffer-create (drepl--buffer-name type default-directory)))))
+
+(cl-defgeneric drepl--command (repl)
+  "The command to start the REPL interpreter, as a list of strings.")
+
+(cl-defgeneric drepl--init (repl)
+  "Initialization code for REPL.
+This function is called in the REPL buffer after a Comint has
+been started in it.  It should call `drepl-mode' or a derived
+mode and perform all other desired initialization procedures.")
+
+(cl-defgeneric drepl--set-options (repl data)
+  "Implementation of the `setoptions' operation.
+This method is called when the REPL sends a `getoptions'
+notification.  The REPL is in `ready' state when this happens.
+The notification message is passed as DATA.")
+
+(defun drepl--adapt-comint-to-mode (mode)
+  "Set up editing in a Comint buffer to resemble major MODE.
+
+Specifically:
+- Set `comint-indirect-setup-function' to MODE.
+- Set syntax table to MODE-syntax-table.
+
+MODE can be a major mode symbol or a string used to look up an
+appropriate mode using `auto-mode-alist'."
+  (when (stringp mode)
+    (setq mode (cdr (assoc mode auto-mode-alist #'string-match-p))))
+  (when (functionp mode)
+    (setq mode (alist-get mode major-mode-remap-alist mode))
+    (when (autoloadp (symbol-function mode))
+      (autoload-do-load (symbol-function mode) mode))
+    (setq-local comint-indirect-setup-function mode)
+    (when-let ((syntbl-sym (derived-mode-syntax-table-name mode))
+               (syntbl-val (when (boundp syntbl-sym)
+                             (symbol-value syntbl-sym))))
+      (when (syntax-table-p syntbl-val)
+        (set-syntax-table syntbl-val)))))
+
+(defun drepl--run (type may-prompt)
+  "Pop to a REPL of the given TYPE or start a new one.
+
+This function is intended to be wrapped in an interactive command
+for each new REPL type.
+
+If MAY-PROMPT is non-nil, prompt for a project in which to run
+it, if necessary."
+  (let ((buffer (drepl--get-buffer-create type may-prompt)))
     (unless (comint-check-proc buffer)
       (cl-letf* (((default-value 'process-environment) process-environment)
                  ((default-value 'exec-path) exec-path)
-                 (repl (make-instance class :buffer buffer))
+                 (constructor (intern (format "%s--create" type)))
+                 (repl (funcall constructor :buffer buffer))
                  (command (drepl--command repl)))
         (with-current-buffer buffer
-          (drepl--message "starting %s" buffer)
+          (drepl--log-message "starting %s" buffer)
           (apply #'make-comint-in-buffer
-               (buffer-name buffer) buffer
-               (car command) nil
-               (cdr command))
+                 (buffer-name buffer) buffer
+                 (car command) nil (cdr command))
           (drepl--init repl)
           (setq drepl--current repl))))
     (pop-to-buffer buffer display-comint-buffer-action)))
@@ -490,5 +582,5 @@ hard reset."
 
 (provide 'drepl)
 
-; LocalWords:  dREPL
+; LocalWords:  dREPL drepl
 ;;; drepl.el ends here
